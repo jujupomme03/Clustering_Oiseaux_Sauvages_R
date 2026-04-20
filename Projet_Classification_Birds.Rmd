@@ -1,0 +1,456 @@
+---
+title: "Classification non supervisée de données morphologiques d'oiseaux"
+subtitle: "M1 MAS — Université Rennes 1"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+---
+
+# Introduction et présentation des données
+
+## Description du jeu de données
+
+```{r librairies}
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(NbClust)
+library(mclust)
+```
+
+```{r import}
+bird <- read_csv("bird.csv")
+glimpse(bird)
+```
+
+Le jeu de données `bird` contient **420 observations** et **12 variables** :
+
+| Variable | Description |
+|----------|-------------|
+| `id` | Identifiant de l'individu |
+| `huml` / `humw` | Longueur / Largeur de l'humérus (aile proximale, en mm) |
+| `ulnal` / `ulnaw` | Longueur / Largeur de l'ulna (aile distale, en mm) |
+| `feml` / `femw` | Longueur / Largeur du fémur (cuisse, en mm) |
+| `tibl` / `tibw` | Longueur / Largeur du tibia (jambe, en mm) |
+| `tarl` / `tarw` | Longueur / Largeur du tarse (pied, en mm) |
+| `type` | Type écologique de l'oiseau (6 modalités) |
+
+Les six types écologiques sont : **P** (Perching, percheur), **R** (Rapacious, rapace), **SO** (Songbird, chanteur), **SW** (Swimming, nageur), **T** (Terrestrial, terrestre) et **W** (Wading, échassier).
+
+## Objectif
+
+L'objectif est d'évaluer dans quelle mesure les **caractéristiques morphologiques osseuses** permettent de distinguer automatiquement les six types écologiques, via trois méthodes de **classification non supervisée** : CAH, K-means et GMM.
+
+La variable `type` est ignorée pendant la classification et sert uniquement à **évaluer a posteriori** la qualité des partitions obtenues.
+
+---
+
+# Pré-traitement des données
+
+## Valeurs manquantes et nettoyage
+
+```{r nettoyage}
+cat("Présence de valeurs manquantes :", anyNA(bird), "\n")
+cat("Effectif initial :", nrow(bird), "\n")
+
+bird_clean <- bird |>
+  filter(if_all(where(is.numeric), ~ !is.na(.) & is.finite(.)))
+
+cat("Effectif après nettoyage :", nrow(bird_clean), "\n")
+cat("Lignes supprimées :", nrow(bird) - nrow(bird_clean), "\n")
+```
+
+## Distribution des types
+
+```{r distrib_types}
+table(bird_clean$type)
+```
+
+## Standardisation
+
+Les variables `id` et `type` sont exclues. Les 10 variables morphologiques sont ensuite **standardisées** (centrées-réduites) pour neutraliser les effets d'échelle.
+
+```{r standardisation}
+bird_data   <- bird_clean |> select(-id, -type)
+bird_scaled <- scale(bird_data)
+
+# Vérification
+round(colMeans(bird_scaled), 6)
+round(apply(bird_scaled, 2, sd), 6)
+```
+
+---
+
+# Analyse exploratoire préalable : ACP
+
+Avant toute classification, une ACP permet de visualiser la structure des données et d'anticiper la difficulté de la tâche.
+
+```{r acp}
+pca_result <- prcomp(bird_scaled)
+bird_type  <- factor(bird_clean$type)
+
+summary(pca_result)$importance[, 1:4]
+```
+
+```{r acp_ind, fig.cap="Projection des individus sur les deux premiers axes de l'ACP, colorés par type réel."}
+fviz_pca_ind(pca_result,
+             geom.ind     = "point",
+             col.ind      = bird_type,
+             palette      = "jco",
+             addEllipses  = TRUE,
+             legend.title = "Type") +
+  ggtitle("ACP : Projection des individus selon leur type réel")
+```
+
+```{r acp_var, fig.cap="Cercle des corrélations : toutes les variables contribuent quasi-uniformément à l'axe 1."}
+fviz_pca_var(pca_result,
+             col.var       = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel         = TRUE) +
+  ggtitle("Contributions des variables aux axes principaux")
+```
+
+**Lecture de l'ACP :**
+L'axe 1 concentre **85,4 % de la variance totale**. Toutes les variables y contribuent de façon quasi-équivalente (flèches parallèles, même longueur) : cet axe représente la **taille corporelle globale**.
+L'axe 2 (6,6 %) oppose les variables de pattes (tarse, tibia, fémur) aux variables d'ailes (humérus, ulna), capturant un contraste secondaire **membres inférieurs vs supérieurs**.
+
+La projection des individus montre des **ellipses très chevauchantes**, à l'exception des chanteurs (SO) et en partie des nageurs (SW) situés aux extrêmes de l'axe 1.
+Cette structure quasi-unidimensionnelle signale que les données portent essentiellement un signal de taille, et que la séparation des six types biologiques sera difficile.
+
+---
+
+# Méthodes de classification non supervisée
+
+## Méthode 1 - Classification Ascendante Hiérarchique (CAH)
+
+### Principe
+
+La CAH regroupe progressivement les individus par fusions successives. On utilise le **critère de Ward**, qui minimise l'accroissement d'inertie intra-classe à chaque fusion :
+
+$$
+d_W(A, B) = \frac{n_A \cdot n_B}{n_A + n_B} \left\| \bar{x}_A - \bar{x}_B \right\|^2
+$$
+
+### Détermination du nombre optimal de clusters
+
+```{r cah_fit}
+distance <- dist(bird_scaled, method = "euclidean")
+cah_ward <- hclust(distance, method = "ward.D2")
+```
+
+```{r dendro, fig.cap="Dendrogramme CAH (Ward). La rupture la plus marquée apparaît à K=2."}
+plot(cah_ward, labels = FALSE, hang = -1,
+     main = "Dendrogramme : CAH (Ward)")
+abline(h = cah_ward$height[length(cah_ward$height) - 1] * 0.9,
+       col = "red", lty = 2)
+```
+
+```{r coude, fig.cap="Méthode du coude : la rupture de pente la plus nette est à K=2, avec un second coude plus modéré vers K=5-6."}
+data.frame(K = 1:15, hauteur = rev(cah_ward$height)[1:15]) |>
+  ggplot(aes(x = K, y = hauteur)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:15) +
+  labs(title = "Méthode du coude : CAH (Ward)",
+       x = "Nombre de clusters K",
+       y = "Hauteur de fusion") +
+  theme_minimal()
+```
+
+```{r nbclust, results='hide', fig.keep='none'}
+set.seed(42)
+nb_res <- NbClust(bird_scaled, distance = "euclidean",
+                  method = "ward.D2", min.nc = 2, max.nc = 10)
+```
+
+```{r nbclust_votes}
+sort(table(nb_res$Best.nc["Number_clusters", ]), decreasing = TRUE)
+```
+
+**Choix de K :**
+L'ensemble des critères convergent : le dendrogramme, la méthode du coude et la majorité des indices de `NbClust` désignent **K = 2** comme partition optimale.
+Ce résultat est cohérent avec la structure de l'ACP : les données s'organisent essentiellement en une opposition entre **petits oiseaux** (SO, P, T) et **grands oiseaux** (SW, R, W).
+
+Nous retenons donc **K = 2** comme partition principale.
+À titre exploratoire, nous examinerons également K = 6 dans une section dédiée, afin d'évaluer si cette contrainte biologique permet de mieux retrouver les types réels.
+
+### Partition à K = 2 (partition optimale)
+
+```{r cah_K2}
+cah_k2 <- cutree(cah_ward, k = 2)
+table(CAH_K2 = cah_k2, Type = bird_clean$type)
+```
+
+```{r cah_K2_plot, fig.cap="Clusters CAH K=2 dans le plan de l'ACP."}
+fviz_cluster(list(data = bird_scaled, cluster = cah_k2),
+             geom = "point", ellipse.type = "convex") +
+  ggtitle("CAH : K = 2 (partition optimale)")
+```
+
+### Partition à K = 6 (analyse exploratoire)
+
+```{r cah_K6}
+cah_k6 <- cutree(cah_ward, k = 6)
+
+plot(cah_ward, labels = FALSE, hang = -1,
+     main = "Dendrogramme : CAH (Ward), K = 6")
+rect.hclust(cah_ward, k = 6, border = 2:7)
+
+table(CAH_K6 = cah_k6, Type = bird_clean$type)
+```
+
+---
+
+## Méthode 2 - K-means
+
+### Principe
+
+Le K-means partitionne les individus en $K$ groupes en minimisant l'inertie intra-classe :
+
+$$
+W(K) = \sum_{k=1}^{K} \sum_{i \in C_k} \left\| x_i - \bar{x}_k \right\|^2
+$$
+
+L'initialisation étant aléatoire, on répète l'algorithme 50 fois (`nstart = 50`) et on retient la meilleure solution.
+
+### Choix de K par la méthode du coude
+
+```{r kmeans_coude, fig.cap="Inertie intra-classe en fonction de K : rupture nette à K=2."}
+set.seed(42)
+inertie <- map_dbl(1:10, ~ kmeans(bird_scaled, centers = .x, nstart = 50)$tot.withinss)
+
+data.frame(K = 1:10, inertie = inertie) |>
+  ggplot(aes(x = K, y = inertie)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "K-means : Méthode du coude",
+       x = "Nombre de clusters K",
+       y = "Inertie intra-classe totale") +
+  theme_minimal()
+```
+
+La courbe confirme une rupture nette à **K = 2**, cohérente avec les résultats de la CAH.
+
+### Partition à K = 2 (partition optimale)
+
+```{r kmeans_K2}
+set.seed(456)
+km_k2 <- kmeans(bird_scaled, centers = 2, nstart = 50)
+table(Kmeans_K2 = km_k2$cluster, Type = bird_clean$type)
+```
+
+```{r kmeans_K2_plot, fig.cap="Clusters K-means K=2 dans le plan de l'ACP."}
+fviz_cluster(km_k2, data = bird_scaled,
+             geom = "point", ellipse.type = "convex") +
+  ggtitle("K-means : K = 2 (partition optimale)")
+```
+
+### Partition à K = 6 (analyse exploratoire)
+
+```{r kmeans_K6}
+set.seed(456)
+km_k6 <- kmeans(bird_scaled, centers = 6, nstart = 50)
+table(Kmeans_K6 = km_k6$cluster, Type = bird_clean$type)
+```
+
+```{r kmeans_K6_plot, fig.cap="Clusters K-means K=6 dans le plan de l'ACP."}
+fviz_cluster(km_k6, data = bird_scaled,
+             geom = "point", ellipse.type = "convex") +
+  ggtitle("K-means : K = 6 (analyse exploratoire)")
+```
+
+---
+
+## Méthode 3 - Modèle de Mélanges Gaussiens (GMM)
+
+### Principe
+
+Le GMM suppose que les données sont générées par un **mélange de $G$ lois gaussiennes multivariées**.
+Chaque individu reçoit une probabilité d'appartenance à chaque groupe (classification souple).
+Les paramètres sont estimés par l'algorithme **EM**, et $G$ ainsi que la structure de covariance sont sélectionnés par le **BIC**.
+
+```{r gmm_fit}
+gmm_model <- Mclust(bird_scaled, verbose = FALSE)
+summary(gmm_model)
+```
+
+```{r gmm_bic, fig.cap="Valeurs de BIC selon le modèle et le nombre de composantes. Le maximum désigne la solution optimale."}
+plot(gmm_model, what = "BIC")
+```
+
+Le modèle sélectionné automatiquement est de type **`r gmm_model$modelName`** avec **`r gmm_model$G` composantes**.
+Pour une comparaison équitable avec K = 2 (recommandé par la CAH et le K-means), nous ajustons également un GMM à G = 2 :
+
+```{r gmm_G2}
+gmm_g2 <- Mclust(bird_scaled, G = 2, verbose = FALSE)
+cat("BIC : GMM libre (G =", gmm_model$G, ") :", round(max(gmm_model$BIC, na.rm = TRUE), 1), "\n")
+cat("BIC : GMM G=2             :", round(gmm_g2$bic, 1), "\n")
+cat("BIC : GMM G=6             :")
+gmm_g6 <- Mclust(bird_scaled, G = 6, verbose = FALSE)
+cat(round(gmm_g6$bic, 1), "\n")
+```
+
+```{r gmm_plot, fig.cap="Clusters GMM (G optimal) dans le plan des deux premiers axes de l'ACP."}
+fviz_mclust(gmm_model, what = "classification", geom = "point",
+            palette = "jco") +
+  ggtitle(paste0("GMM : G = ", gmm_model$G, " (BIC optimal)"))
+```
+
+```{r gmm_tables}
+cat("GMM G optimal (G =", gmm_model$G, ")")
+print(table(GMM_opt = gmm_model$classification, Type = bird_clean$type))
+
+cat("\nGMM G=2")
+print(table(GMM_G2 = gmm_g2$classification, Type = bird_clean$type))
+
+cat("\nGMM G=6")
+print(table(GMM_G6 = gmm_g6$classification, Type = bird_clean$type))
+```
+
+---
+
+# Comparaison et évaluation des méthodes
+
+## Adjusted Rand Index (ARI)
+
+L'ARI mesure la concordance entre la partition obtenue et les vraies étiquettes, corrigée pour le hasard (0 = aléatoire, 1 = parfait).
+
+```{r ari}
+type_num <- as.numeric(factor(bird_clean$type))
+
+ari_results <- tibble(
+  Méthode    = c("CAH K=2", "CAH K=6",
+                 "K-means K=2", "K-means K=6",
+                 paste0("GMM G=", gmm_model$G, " (opt.)"),
+                 "GMM G=2", "GMM G=6"),
+  K          = c(2, 6, 2, 6, gmm_model$G, 2, 6),
+  ARI        = round(c(
+    adjustedRandIndex(cah_k2,                 type_num),
+    adjustedRandIndex(cah_k6,                 type_num),
+    adjustedRandIndex(km_k2$cluster,          type_num),
+    adjustedRandIndex(km_k6$cluster,          type_num),
+    adjustedRandIndex(gmm_model$classification, type_num),
+    adjustedRandIndex(gmm_g2$classification,  type_num),
+    adjustedRandIndex(gmm_g6$classification,  type_num)
+  ), 3)
+)
+
+knitr::kable(ari_results, caption = "ARI de chaque méthode et partition")
+```
+
+## Description morphologique des groupes
+
+Cette section décrit les profils moyens de chaque cluster pour les deux partitions principales (K=2 et K=6 pour K-means, à titre comparatif).
+
+```{r morpho_K2}
+cat("Profils morphologiques moyens : K-means K=2")
+round(aggregate(bird_data, by = list(Cluster = km_k2$cluster), mean), 1)
+```
+
+```{r morpho_K6}
+cat(" Profils morphologiques moyens : K-means K=6")
+round(aggregate(bird_data, by = list(Cluster = km_k6$cluster), mean), 1)
+```
+
+```{r boxplots_K2, fig.cap="Distribution des variables morphologiques par cluster K-means K=2. Les points rouges indiquent les moyennes.", fig.height=8}
+bird_data |>
+  mutate(Cluster = factor(km_k2$cluster,
+                          labels = c("Groupe 1 — Petits oiseaux",
+                                     "Groupe 2 — Grands oiseaux")[sort(unique(km_k2$cluster))])) |>
+  pivot_longer(-Cluster, names_to = "variable", values_to = "valeur") |>
+  ggplot(aes(x = Cluster, y = valeur, fill = Cluster)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 2, color = "red") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  labs(title = "Variables morphologiques par cluster : K-means K=2",
+       x = NULL, y = "Valeur (mm)") +
+  theme_minimal() +
+  theme(legend.position = "bottom", axis.text.x = element_blank())
+```
+
+```{r boxplots_K6, fig.cap="Distribution des variables morphologiques par cluster K-means K=6 (analyse exploratoire).", fig.height=8}
+bird_data |>
+  mutate(Cluster = factor(km_k6$cluster)) |>
+  pivot_longer(-Cluster, names_to = "variable", values_to = "valeur") |>
+  ggplot(aes(x = Cluster, y = valeur, fill = Cluster)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 2, color = "red") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  labs(title = "Variables morphologiques par cluster : K-means K=6",
+       x = "Cluster", y = "Valeur (mm)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### Interprétation des profils morphologiques
+
+**Partition à K = 2 :**
+La partition optimale révèle une opposition claire entre deux profils morphologiques :
+
+| Cluster | Profil moyen | Types dominants |
+|---------|-------------|-----------------|
+| 1 | Toutes mesures **faibles** (ex. huml ≈ 25 mm) | SO (chanteurs), P (percheurs), T (terrestres) |
+| 2 | Toutes mesures **élevées** (ex. huml ≈ 100 mm) | SW (nageurs), R (rapaces), W (échassiers) |
+
+La séparation est quasi-parfaite selon la taille corporelle globale. Elle confirme que la première dimension de variation dans les données est un **gradient de taille**, non un signal de type écologique.
+
+**Partition à K = 6 (exploratoire) :**
+En forçant six groupes, les clusters se subdivisent progressivement selon la taille, produisant un continuum de gabarits plutôt que six profils écologiquement distincts. Seuls les chanteurs (SO) et certains nageurs (SW) extrêmes sont isolés de façon cohérente, les autres types restant mélangés dans des clusters de taille intermédiaire.
+
+---
+
+# Discussion et conclusion
+
+## Synthèse comparative
+
+```{r synthese_finale}
+knitr::kable(
+  ari_results,
+  caption = "Récapitulatif des ARI par méthode et nombre de clusters"
+)
+```
+
+## Interprétation globale
+
+Plusieurs enseignements se dégagent de cette analyse.
+
+**K = 2 est la partition que les données soutiennent.** Les trois méthodes convergent vers ce résultat, et l'ACP l'explique : 85,4 % de la variance est portée par un unique axe de taille corporelle. Les méthodes non supervisées font exactement ce pour quoi elles sont conçues — elles trouvent la structure dominante des données, qui est ici une opposition taille/gabarit.
+
+**Les ARI à K = 2 sont modérés** (autour de 0,30–0,40 selon les méthodes) parce que les six types biologiques ne se répartissent pas proprement entre les deux groupes : les rapaces et les échassiers cohabitent avec les nageurs dans le groupe "grands oiseaux", tandis que les percheurs et les terrestres rejoignent les chanteurs dans le groupe "petits oiseaux".
+
+**Forcer K = 6 dégrade les ARI** (≈ 0,20–0,26) malgré un plus grand nombre de clusters. Ce paradoxe apparent s'explique par le fait que la subdivision en 6 groupes suit le continuum de taille plutôt que les frontières biologiques réelles : on obtient 6 tranches de gabarit, pas 6 types écologiques.
+
+**Le GMM à G optimal sélectionne `r gmm_model$G` composantes**, révélant une hétérogénéité plus fine que les 6 catégories. Les clusters GMM correspondent à des sous-populations morphologiques au sein des grands groupes — ce qui est informatif biologiquement mais ne coïncide pas avec la classification écologique.
+
+**Les chanteurs (SO) sont l'exception notable** : leur très petite taille les rend morphologiquement distincts et ils sont bien isolés dans toutes les méthodes et pour toutes les valeurs de K testées.
+
+## Conclusion
+
+La classification non supervisée basée sur les seules mesures osseuses ne permet pas de reconstituer les six catégories écologiques d'oiseaux. Cette limite est structurelle : les données varient quasi-exclusivement selon une dimension de taille corporelle, alors que les types écologiques croisent cette dimension sans s'y réduire (un rapace et un échassier peuvent avoir des mesures similaires).
+
+Ce résultat n'est pas un échec des méthodes : il souligne que **les variables disponibles ne sont pas suffisamment discriminantes** pour ce problème à six classes. Des pistes d'amélioration seraient d'intégrer des variables de forme (ratios longueur/largeur, rapport aile/patte) qui capturent la morphologie indépendamment de la taille, ou de recourir à une approche supervisée exploitant les étiquettes connues.
